@@ -2,6 +2,7 @@ type llty =
   | I1
   | I8
   | I32
+  | I64
   | Void
   | Ptr
 
@@ -9,6 +10,7 @@ let string_of_llty = function
   | I1 -> "i1"
   | I8 -> "i8"
   | I32 -> "i32"
+  | I64 -> "i64"
   | Void -> "void"
   | Ptr -> "ptr"
 

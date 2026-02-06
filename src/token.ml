@@ -1,6 +1,8 @@
 type kind =
   | Ident of string
   | Int_lit of int
+  | Char_lit of int
+  | String_lit of string
   | Kw_int
   | Kw_char
   | Kw_void
@@ -46,6 +48,8 @@ type t =
 let kind_to_string = function
   | Ident s -> Printf.sprintf "identifier(%s)" s
   | Int_lit n -> Printf.sprintf "int(%d)" n
+  | Char_lit n -> Printf.sprintf "char(%d)" n
+  | String_lit s -> Printf.sprintf "string(%S)" s
   | Kw_int -> "int"
   | Kw_char -> "char"
   | Kw_void -> "void"

@@ -90,6 +90,60 @@ let rec lex_int (lx : t) (acc : int) : int =
       lex_int lx acc'
   | _ -> acc
 
+let loc_from (start : Loc.position) (lx : t) : Loc.t = { Loc.start; end_ = current_pos lx }
+
+let decode_escape (lx : t) (start : Loc.position) : char =
+  match peek lx with
+  | None -> Util.error (loc_from start lx) "unterminated escape sequence"
+  | Some c ->
+      bump lx;
+      (match c with
+      | 'n' -> '\n'
+      | 't' -> '\t'
+      | 'r' -> '\r'
+      | '0' -> '\000'
+      | '\\' -> '\\'
+      | '\'' -> '\''
+      | '"' -> '"'
+      | _ -> Util.error (loc_from start lx) "unsupported escape sequence '\\%c'" c)
+
+let lex_char_lit (lx : t) (start : Loc.position) : int =
+  let c =
+    match peek lx with
+    | None | Some '\n' -> Util.error (loc_from start lx) "unterminated char literal"
+    | Some '\'' -> Util.error (loc_from start lx) "empty char literal"
+    | Some '\\' ->
+        bump lx;
+        decode_escape lx start
+    | Some c ->
+        bump lx;
+        c
+  in
+  (match peek lx with
+  | Some '\'' -> bump lx
+  | Some _ -> Util.error (loc_from start lx) "multi-character char literal is not supported"
+  | None -> Util.error (loc_from start lx) "unterminated char literal");
+  Char.code c
+
+let lex_string_lit (lx : t) (start : Loc.position) : string =
+  let buf = Buffer.create 32 in
+  let rec loop () =
+    match peek lx with
+    | None | Some '\n' -> Util.error (loc_from start lx) "unterminated string literal"
+    | Some '"' ->
+        bump lx;
+        Buffer.contents buf
+    | Some '\\' ->
+        bump lx;
+        Buffer.add_char buf (decode_escape lx start);
+        loop ()
+    | Some c ->
+        bump lx;
+        Buffer.add_char buf c;
+        loop ()
+  in
+  loop ()
+
 let keyword_or_ident (s : string) : Token.kind =
   match s with
   | "int" -> Kw_int
@@ -198,6 +252,12 @@ let next (lx : t) : Token.t =
               bump lx;
               mk Gt_eq
           | _ -> mk Gt)
+      | '\'' ->
+          bump lx;
+          mk (Char_lit (lex_char_lit lx start))
+      | '"' ->
+          bump lx;
+          mk (String_lit (lex_string_lit lx start))
       | '0' .. '9' ->
           let n = lex_int lx 0 in
           mk (Int_lit n)

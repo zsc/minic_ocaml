@@ -32,6 +32,8 @@ type texpr =
 
 and texpr_node =
   | EIntLit of int
+  | ECharLit of int
+  | EStringLit of string
   | EVar of var_id
   | ECall of string * texpr list
   | EAssign of tlvalue * texpr
@@ -163,6 +165,25 @@ let is_scalar = function
   | Ast.TInt | Ast.TChar -> true
   | Ast.TPtr _ -> true
   | Ast.TVoid | Ast.TStruct _ | Ast.TUnion _ -> false
+
+let is_pointer = function
+  | Ast.TPtr _ -> true
+  | _ -> false
+
+let has_size (env : env) (ty : ty) : bool =
+  match ty with
+  | Ast.TInt | Ast.TChar | Ast.TPtr _ -> true
+  | Ast.TVoid -> false
+  | Ast.TStruct n -> Hashtbl.mem env.tags (tag_key Ast.Struct n)
+  | Ast.TUnion n -> Hashtbl.mem env.tags (tag_key Ast.Union n)
+
+let require_pointer_arith_base (env : env) (pty : ty) (loc : Loc.t) : unit =
+  match pty with
+  | Ast.TVoid -> Util.error loc "pointer arithmetic on void* is not supported"
+  | _ ->
+      if not (has_size env pty) then
+        Util.error loc "pointer arithmetic requires complete pointee type, got %s"
+          (string_of_ty pty)
 
 let can_convert ~(dst : ty) ~(src : ty) : bool =
   if equal_ty dst src then true
@@ -371,6 +392,8 @@ let rec tc_expr (env : env) (venv : venv) (inits : IntSet.t) (e : Ast.expr) :
   let loc = e.eloc in
   match e.enode with
   | Ast.IntLit n -> ({ e_node = EIntLit n; e_ty = Ast.TInt; e_loc = loc }, inits)
+  | Ast.CharLit n -> ({ e_node = ECharLit n; e_ty = Ast.TChar; e_loc = loc }, inits)
+  | Ast.StringLit s -> ({ e_node = EStringLit s; e_ty = Ast.TPtr Ast.TChar; e_loc = loc }, inits)
   | Ast.Var name -> (
       match find_var venv name with
       | None -> Util.error loc "undeclared identifier %s" name
@@ -470,7 +493,39 @@ and tc_binop (env : env) (venv : venv) (inits : IntSet.t) (loc : Loc.t) (op : As
   let ta, inits1 = tc_expr env venv inits a in
   let tb, inits2 = tc_expr env venv inits1 b in
   match op with
-  | Ast.Add | Ast.Sub | Ast.Mul | Ast.Div | Ast.Mod ->
+  | Ast.Add -> (
+      match (ta.e_ty, tb.e_ty) with
+      | ta_ty, tb_ty when is_integer ta_ty && is_integer tb_ty ->
+          let ta' = promote_int ta in
+          let tb' = promote_int tb in
+          ({ e_node = EBinop (op, ta', tb'); e_ty = Ast.TInt; e_loc = loc }, inits2)
+      | Ast.TPtr pty, rhs_ty when is_integer rhs_ty ->
+          require_pointer_arith_base env pty loc;
+          let tb' = promote_int tb in
+          ({ e_node = EBinop (op, ta, tb'); e_ty = ta.e_ty; e_loc = loc }, inits2)
+      | lhs_ty, Ast.TPtr pty when is_integer lhs_ty ->
+          require_pointer_arith_base env pty loc;
+          let ta' = promote_int ta in
+          ({ e_node = EBinop (op, ta', tb); e_ty = tb.e_ty; e_loc = loc }, inits2)
+      | _ -> Util.error loc "pointer arithmetic requires ptr +/- int")
+  | Ast.Sub -> (
+      match (ta.e_ty, tb.e_ty) with
+      | ta_ty, tb_ty when is_integer ta_ty && is_integer tb_ty ->
+          let ta' = promote_int ta in
+          let tb' = promote_int tb in
+          ({ e_node = EBinop (op, ta', tb'); e_ty = Ast.TInt; e_loc = loc }, inits2)
+      | Ast.TPtr pty, rhs_ty when is_integer rhs_ty ->
+          require_pointer_arith_base env pty loc;
+          let tb' = promote_int tb in
+          ({ e_node = EBinop (op, ta, tb'); e_ty = ta.e_ty; e_loc = loc }, inits2)
+      | Ast.TPtr pa, Ast.TPtr pb ->
+          require_pointer_arith_base env pa loc;
+          require_pointer_arith_base env pb loc;
+          if not (equal_ty pa pb) then
+            Util.error loc "pointer subtraction requires same pointee type";
+          ({ e_node = EBinop (op, ta, tb); e_ty = Ast.TInt; e_loc = loc }, inits2)
+      | _ -> Util.error loc "pointer arithmetic requires ptr +/- int or ptr - ptr")
+  | Ast.Mul | Ast.Div | Ast.Mod ->
       if not (is_integer ta.e_ty && is_integer tb.e_ty) then Util.error loc "arithmetic requires int/char";
       let ta' = promote_int ta in
       let tb' = promote_int tb in

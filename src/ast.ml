@@ -35,6 +35,8 @@ type expr =
 
 and expr_node =
   | IntLit of int
+  | CharLit of int
+  | StringLit of string
   | Var of string
   | Call of string * expr list
   | Assign of expr * expr

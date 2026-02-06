@@ -66,17 +66,19 @@
   3:3: error: duplicate declaration of x
   [1]
 
-  $ cat > ptr_arith.c <<'EOF'
+  $ cat > ptr_plus_ptr.c <<'EOF'
   > int main() {
   >   int x = 0;
+  >   int y = 0;
   >   int* p = &x;
-  >   p + 1;
+  >   int* q = &y;
+  >   p + q;
   >   return 0;
   > }
   > EOF
 
-  $ ../src/main.exe ptr_arith.c -o out.ll 2>&1
-  4:3: error: arithmetic requires int/char
+  $ ../src/main.exe ptr_plus_ptr.c -o out.ll 2>&1
+  6:3: error: pointer arithmetic requires ptr +/- int
   [1]
 
   $ cat > assign_non_lvalue.c <<'EOF'
@@ -90,4 +92,3 @@
   $ ../src/main.exe assign_non_lvalue.c -o out.ll 2>&1
   3:3: error: expected lvalue
   [1]
-

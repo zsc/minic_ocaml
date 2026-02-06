@@ -7,10 +7,18 @@ type var_info =
   ; addr : Llvm_ir.value
   }
 
+type cg_ctx =
+  { mutable next_str_id : int
+  ; str_tbl : (string, string) Hashtbl.t
+  ; mutable str_defs_rev : string list
+  }
+
 type env =
   { vars : var_info IntMap.t
   ; func_ret : Ast.ty
   ; mutable loop_stack : (string * string) list
+  ; ctx : cg_ctx
+  ; tag_layouts : (string, tag_layout) Hashtbl.t
   }
 
 let string_of_tag_kind = function
@@ -23,6 +31,41 @@ let tag_key (kind : Ast.tag_kind) (name : string) : string =
 let is_aggregate_ty = function
   | Ast.TStruct _ | Ast.TUnion _ -> true
   | _ -> false
+
+let is_integer_ty = function
+  | Ast.TInt | Ast.TChar -> true
+  | _ -> false
+
+let create_ctx () : cg_ctx = { next_str_id = 0; str_tbl = Hashtbl.create 32; str_defs_rev = [] }
+
+let escape_llvm_string (s : string) : string =
+  let buf = Buffer.create ((String.length s * 2) + 4) in
+  String.iter
+    (fun c ->
+      let code = Char.code c in
+      if code >= 32 && code <= 126 && c <> '"' && c <> '\\' then
+        Buffer.add_char buf c
+      else
+        Buffer.add_string buf (Printf.sprintf "\\%02X" code))
+    s;
+  Buffer.add_string buf "\\00";
+  Buffer.contents buf
+
+let intern_string_literal (ctx : cg_ctx) (s : string) : string =
+  match Hashtbl.find_opt ctx.str_tbl s with
+  | Some sym -> sym
+  | None ->
+      let id = ctx.next_str_id in
+      ctx.next_str_id <- id + 1;
+      let sym = Printf.sprintf "@.str.%d" id in
+      let len = String.length s + 1 in
+      let body = escape_llvm_string s in
+      let def =
+        Printf.sprintf "%s = private unnamed_addr constant [%d x i8] c\"%s\", align 1" sym len body
+      in
+      Hashtbl.add ctx.str_tbl s sym;
+      ctx.str_defs_rev <- def :: ctx.str_defs_rev;
+      sym
 
 let llty_of_mini = function
   | Ast.TInt -> Llvm_ir.I32
@@ -50,11 +93,21 @@ let storage_ty_string (tag_layouts : (string, tag_layout) Hashtbl.t) (ty : Ast.t
   else
     Llvm_ir.string_of_llty (llty_of_mini ty)
 
+let sizeof_ty (tag_layouts : (string, tag_layout) Hashtbl.t) (ty : Ast.ty) : int =
+  match ty with
+  | Ast.TInt -> 4
+  | Ast.TChar -> 1
+  | Ast.TPtr _ -> 8
+  | Ast.TStruct _ | Ast.TUnion _ -> (aggregate_layout tag_layouts ty).size
+  | Ast.TVoid -> Util.error Loc.none "internal: void pointee in pointer arithmetic"
+
 let bool_of_scalar (b : Llvm_ir.builder) (v : Llvm_ir.value) : Llvm_ir.value =
   match v.ty with
   | Llvm_ir.I1 -> v
   | Llvm_ir.I32 ->
       Llvm_ir.emit_icmp b "ne" Llvm_ir.I32 v { v = "0"; ty = Llvm_ir.I32 }
+  | Llvm_ir.I64 ->
+      Llvm_ir.emit_icmp b "ne" Llvm_ir.I64 v { v = "0"; ty = Llvm_ir.I64 }
   | Llvm_ir.I8 ->
       let v32 = Llvm_ir.emit_cast b "sext" Llvm_ir.I8 Llvm_ir.I32 v in
       Llvm_ir.emit_icmp b "ne" Llvm_ir.I32 v32 { v = "0"; ty = Llvm_ir.I32 }
@@ -92,6 +145,8 @@ let rec gen_lvalue (b : Llvm_ir.builder) (env : env) (lv : tlvalue) : Llvm_ir.va
 and gen_expr (b : Llvm_ir.builder) (env : env) (e : texpr) : Llvm_ir.value =
   match e.e_node with
   | EIntLit n -> { Llvm_ir.v = string_of_int n; ty = Llvm_ir.I32 }
+  | ECharLit n -> { Llvm_ir.v = string_of_int n; ty = Llvm_ir.I8 }
+  | EStringLit s -> { Llvm_ir.v = intern_string_literal env.ctx s; ty = Llvm_ir.Ptr }
   | EVar id -> (
       match IntMap.find_opt id env.vars with
       | None -> Util.error e.e_loc "unknown var id %d" id
@@ -140,11 +195,77 @@ and gen_cast (b : Llvm_ir.builder) (from_ty : Ast.ty) (to_ty : Ast.ty) (v : Llvm
     | Ast.TPtr _, Ast.TPtr _ -> v
     | _ -> v
 
+and gen_ptr_plus_int (b : Llvm_ir.builder) (tag_layouts : (string, tag_layout) Hashtbl.t)
+    (ptr_ty : Ast.ty) (ptr_v : Llvm_ir.value) (idx_v : Llvm_ir.value) (is_sub : bool) : Llvm_ir.value =
+  let pointee =
+    match ptr_ty with
+    | Ast.TPtr t -> t
+    | _ -> Util.error Loc.none "internal: gen_ptr_plus_int requires pointer type"
+  in
+  let elem_size = sizeof_ty tag_layouts pointee in
+  let idx64 =
+    match idx_v.ty with
+    | Llvm_ir.I64 -> idx_v
+    | Llvm_ir.I32 -> Llvm_ir.emit_cast b "sext" Llvm_ir.I32 Llvm_ir.I64 idx_v
+    | Llvm_ir.I8 -> Llvm_ir.emit_cast b "sext" Llvm_ir.I8 Llvm_ir.I64 idx_v
+    | _ -> Util.error Loc.none "internal: pointer arithmetic index must be integer"
+  in
+  let scaled =
+    if elem_size = 1 then idx64
+    else
+      Llvm_ir.emit_binop b "mul" Llvm_ir.I64 idx64
+        { v = string_of_int elem_size; ty = Llvm_ir.I64 }
+  in
+  let base = Llvm_ir.emit_cast b "ptrtoint" Llvm_ir.Ptr Llvm_ir.I64 ptr_v in
+  let out_i64 =
+    Llvm_ir.emit_binop b (if is_sub then "sub" else "add") Llvm_ir.I64 base scaled
+  in
+  Llvm_ir.emit_cast b "inttoptr" Llvm_ir.I64 Llvm_ir.Ptr out_i64
+
+and gen_ptr_minus_ptr (b : Llvm_ir.builder) (tag_layouts : (string, tag_layout) Hashtbl.t)
+    (ptr_ty : Ast.ty) (a : Llvm_ir.value) (c : Llvm_ir.value) : Llvm_ir.value =
+  let pointee =
+    match ptr_ty with
+    | Ast.TPtr t -> t
+    | _ -> Util.error Loc.none "internal: gen_ptr_minus_ptr requires pointer type"
+  in
+  let elem_size = sizeof_ty tag_layouts pointee in
+  let ai = Llvm_ir.emit_cast b "ptrtoint" Llvm_ir.Ptr Llvm_ir.I64 a in
+  let ci = Llvm_ir.emit_cast b "ptrtoint" Llvm_ir.Ptr Llvm_ir.I64 c in
+  let bytes = Llvm_ir.emit_binop b "sub" Llvm_ir.I64 ai ci in
+  let elems =
+    if elem_size = 1 then bytes
+    else
+      Llvm_ir.emit_binop b "sdiv" Llvm_ir.I64 bytes
+        { v = string_of_int elem_size; ty = Llvm_ir.I64 }
+  in
+  Llvm_ir.emit_cast b "trunc" Llvm_ir.I64 Llvm_ir.I32 elems
+
 and gen_binop (b : Llvm_ir.builder) (env : env) (_loc : Loc.t) (op : Ast.binop) (a : texpr)
     (c : texpr) : Llvm_ir.value =
   match op with
-  | Ast.Add -> Llvm_ir.emit_binop b "add" Llvm_ir.I32 (gen_expr b env a) (gen_expr b env c)
-  | Ast.Sub -> Llvm_ir.emit_binop b "sub" Llvm_ir.I32 (gen_expr b env a) (gen_expr b env c)
+  | Ast.Add ->
+      let va = gen_expr b env a in
+      let vc = gen_expr b env c in
+      if is_integer_ty a.e_ty && is_integer_ty c.e_ty then
+        Llvm_ir.emit_binop b "add" Llvm_ir.I32 va vc
+      else if va.ty = Llvm_ir.Ptr && vc.ty <> Llvm_ir.Ptr then
+        gen_ptr_plus_int b env.tag_layouts a.e_ty va vc false
+      else if va.ty <> Llvm_ir.Ptr && vc.ty = Llvm_ir.Ptr then
+        gen_ptr_plus_int b env.tag_layouts c.e_ty vc va false
+      else
+        Util.error Loc.none "internal: unsupported add operands"
+  | Ast.Sub ->
+      let va = gen_expr b env a in
+      let vc = gen_expr b env c in
+      if is_integer_ty a.e_ty && is_integer_ty c.e_ty then
+        Llvm_ir.emit_binop b "sub" Llvm_ir.I32 va vc
+      else if va.ty = Llvm_ir.Ptr && vc.ty <> Llvm_ir.Ptr then
+        gen_ptr_plus_int b env.tag_layouts a.e_ty va vc true
+      else if va.ty = Llvm_ir.Ptr && vc.ty = Llvm_ir.Ptr then
+        gen_ptr_minus_ptr b env.tag_layouts a.e_ty va vc
+      else
+        Util.error Loc.none "internal: unsupported sub operands"
   | Ast.Mul -> Llvm_ir.emit_binop b "mul" Llvm_ir.I32 (gen_expr b env a) (gen_expr b env c)
   | Ast.Div -> Llvm_ir.emit_binop b "sdiv" Llvm_ir.I32 (gen_expr b env a) (gen_expr b env c)
   | Ast.Mod -> Llvm_ir.emit_binop b "srem" Llvm_ir.I32 (gen_expr b env a) (gen_expr b env c)
@@ -299,7 +420,7 @@ let declare_builtins () : string =
     ; "declare void @free(ptr)"
     ]
 
-let gen_function (tag_layouts : (string, tag_layout) Hashtbl.t) (f : tfunc) : string =
+let gen_function (tag_layouts : (string, tag_layout) Hashtbl.t) (ctx : cg_ctx) (f : tfunc) : string =
   let b = Llvm_ir.create_builder () in
   let vars =
     List.fold_left
@@ -322,7 +443,7 @@ let gen_function (tag_layouts : (string, tag_layout) Hashtbl.t) (f : tfunc) : st
       Llvm_ir.emit b
         (Printf.sprintf "store %s %%%s, ptr %s" (Llvm_ir.string_of_llty llty) p.pname addr.v))
     f.params;
-  let env = { vars; func_ret = f.ret_ty; loop_stack = [] } in
+  let env = { vars; func_ret = f.ret_ty; loop_stack = []; ctx; tag_layouts } in
   gen_stmt b env f.body;
   if not b.current.terminated then (
     match f.ret_ty with
@@ -349,5 +470,8 @@ let gen_program (prog : tprogram) : string =
   List.iter
     (fun (t : tag_layout) -> Hashtbl.replace tag_layouts (tag_key t.tag_kind t.tag_name) t)
     prog.tags;
-  let funcs = prog.funcs |> List.map (gen_function tag_layouts) |> String.concat "\n" in
-  declare_builtins () ^ "\n\n" ^ funcs
+  let ctx = create_ctx () in
+  let funcs = prog.funcs |> List.map (gen_function tag_layouts ctx) |> String.concat "\n" in
+  let str_defs = ctx.str_defs_rev |> List.rev |> String.concat "\n" in
+  let sections = [ declare_builtins (); str_defs; funcs ] |> List.filter (fun s -> s <> "") in
+  String.concat "\n\n" sections

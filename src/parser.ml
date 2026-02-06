@@ -417,6 +417,14 @@ and parse_primary (p : t) : Ast.expr =
       let t = p.cur in
       bump p;
       { enode = IntLit n; eloc = t.loc }
+  | Token.Char_lit n ->
+      let t = p.cur in
+      bump p;
+      { enode = CharLit n; eloc = t.loc }
+  | Token.String_lit s ->
+      let t = p.cur in
+      bump p;
+      { enode = StringLit s; eloc = t.loc }
   | Token.Ident s ->
       let id_tok = p.cur in
       bump p;
