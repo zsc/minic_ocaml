@@ -5,6 +5,9 @@
 #   make ARCH=
 ARCH ?= $(shell arch -arm64 /usr/bin/true >/dev/null 2>&1 && printf 'arch -arm64' || printf '')
 
+# Use system clang to avoid Homebrew GCC header issues on macOS
+export PATH := /usr/bin:$(PATH)
+
 DUNE ?= dune
 
 LLVM_BIN ?= /opt/homebrew/opt/llvm/bin
