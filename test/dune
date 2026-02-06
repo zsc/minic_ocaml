@@ -1,0 +1,6 @@
+(cram
+ (deps
+  %{exe:../src/main.exe}
+  /opt/homebrew/opt/llvm/bin/llvm-as
+  /opt/homebrew/opt/llvm/bin/lli))
+

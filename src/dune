@@ -1,0 +1,16 @@
+(executable
+ (name main)
+ (public_name minic)
+ (modes byte)
+ (modules
+  ast
+  codegen
+  driver
+  lexer
+  llvm_ir
+  loc
+  main
+  parser
+  token
+  typecheck
+  util))

@@ -1,0 +1,14 @@
+opam-version: "2.0"
+name: "minic_ocaml"
+version: "0.0.0"
+maintainer: "unknown"
+authors: "unknown"
+license: "MIT"
+depends: [
+  "ocaml"
+  "dune"
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]
+
