@@ -95,6 +95,8 @@ let keyword_or_ident (s : string) : Token.kind =
   | "int" -> Kw_int
   | "char" -> Kw_char
   | "void" -> Kw_void
+  | "struct" -> Kw_struct
+  | "union" -> Kw_union
   | "if" -> Kw_if
   | "else" -> Kw_else
   | "while" -> Kw_while
@@ -132,12 +134,19 @@ let next (lx : t) : Token.t =
       | ';' ->
           bump lx;
           mk Semi
+      | '.' ->
+          bump lx;
+          mk Dot
       | '+' ->
           bump lx;
           mk Plus
       | '-' ->
           bump lx;
-          mk Minus
+          (match peek lx with
+          | Some '>' ->
+              bump lx;
+              mk Arrow
+          | _ -> mk Minus)
       | '*' ->
           bump lx;
           mk Star
@@ -202,4 +211,3 @@ let next (lx : t) : Token.t =
       | _ ->
           bump lx;
           Util.error { Loc.start; end_ = current_pos lx } "unexpected character '%c'" c)
-

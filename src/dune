@@ -2,6 +2,7 @@
  (name main)
  (public_name minic)
  (modes byte)
+ (libraries unix)
  (modules
   ast
   codegen

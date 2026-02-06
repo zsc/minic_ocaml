@@ -8,6 +8,22 @@ type func_sig =
   ; params : ty list
   }
 
+type field_layout =
+  { fld_name : string
+  ; fld_ty : ty
+  ; fld_offset : int
+  ; fld_loc : Loc.t
+  }
+
+type tag_layout =
+  { tag_kind : Ast.tag_kind
+  ; tag_name : string
+  ; fields : field_layout list
+  ; size : int
+  ; align : int
+  ; loc : Loc.t
+  }
+
 type texpr =
   { e_node : texpr_node
   ; e_ty : ty
@@ -23,6 +39,7 @@ and texpr_node =
   | EUnop of Ast.unop * texpr
   | EAddrOf of tlvalue
   | ECast of ty * texpr
+  | ELvalue of tlvalue
 
 and tlvalue =
   { lv_node : lvalue_node
@@ -33,6 +50,7 @@ and tlvalue =
 and lvalue_node =
   | LVar of var_id
   | LDeref of texpr
+  | LMember of tlvalue * field_layout
 
 type tstmt =
   { st_node : tstmt_node
@@ -69,10 +87,14 @@ type tfunc =
   ; loc : Loc.t
   }
 
-type tprogram = tfunc list
+type tprogram =
+  { funcs : tfunc list
+  ; tags : tag_layout list
+  }
 
 type env =
   { funcs : (string, func_sig) Hashtbl.t
+  ; tags : (string, tag_layout) Hashtbl.t
   ; mutable next_var : int
   }
 
@@ -104,12 +126,21 @@ let find_var (st : venv) (name : string) : var_sym option =
   in
   go st
 
+let string_of_tag_kind = function
+  | Ast.Struct -> "struct"
+  | Ast.Union -> "union"
+
+let tag_key (kind : Ast.tag_kind) (name : string) : string =
+  Printf.sprintf "%s:%s" (string_of_tag_kind kind) name
+
 let rec equal_ty (a : ty) (b : ty) : bool =
   match (a, b) with
   | Ast.TInt, Ast.TInt -> true
   | Ast.TChar, Ast.TChar -> true
   | Ast.TVoid, Ast.TVoid -> true
   | Ast.TPtr x, Ast.TPtr y -> equal_ty x y
+  | Ast.TStruct a, Ast.TStruct b -> String.equal a b
+  | Ast.TUnion a, Ast.TUnion b -> String.equal a b
   | _ -> false
 
 let rec string_of_ty = function
@@ -117,15 +148,21 @@ let rec string_of_ty = function
   | Ast.TChar -> "char"
   | Ast.TVoid -> "void"
   | Ast.TPtr t -> Printf.sprintf "%s*" (string_of_ty t)
+  | Ast.TStruct name -> Printf.sprintf "struct %s" name
+  | Ast.TUnion name -> Printf.sprintf "union %s" name
 
 let is_integer = function
   | Ast.TInt | Ast.TChar -> true
   | _ -> false
 
+let is_aggregate = function
+  | Ast.TStruct _ | Ast.TUnion _ -> true
+  | _ -> false
+
 let is_scalar = function
   | Ast.TInt | Ast.TChar -> true
   | Ast.TPtr _ -> true
-  | Ast.TVoid -> false
+  | Ast.TVoid | Ast.TStruct _ | Ast.TUnion _ -> false
 
 let can_convert ~(dst : ty) ~(src : ty) : bool =
   if equal_ty dst src then true
@@ -168,21 +205,166 @@ let builtin_funcs () : (string * func_sig) list =
   ; ("free", { ret_ty = Ast.TVoid; params = [ Ast.TPtr Ast.TVoid ] })
   ]
 
-let build_func_env (prog : Ast.program) : env =
+let build_tag_layouts (prog : Ast.program) : (string, tag_layout) Hashtbl.t * tag_layout list =
+  let defs : (string, Ast.type_def) Hashtbl.t = Hashtbl.create 32 in
+  List.iter
+    (function
+      | Ast.TopTypeDef td ->
+          let key = tag_key td.tag_kind td.tag_name in
+          if Hashtbl.mem defs key then
+            Util.error td.loc "duplicate %s %s definition" (string_of_tag_kind td.tag_kind) td.tag_name;
+          Hashtbl.add defs key td
+      | Ast.TopFunc _ -> ())
+    prog;
+  let resolved : (string, tag_layout) Hashtbl.t = Hashtbl.create 32 in
+  let visiting : (string, unit) Hashtbl.t = Hashtbl.create 32 in
+  let align_up (n : int) (a : int) : int =
+    if a <= 1 then n else ((n + a - 1) / a) * a
+  in
+  let rec resolve (kind : Ast.tag_kind) (name : string) (loc : Loc.t) : tag_layout =
+    let key = tag_key kind name in
+    match Hashtbl.find_opt resolved key with
+    | Some lay -> lay
+    | None -> (
+        let td =
+          match Hashtbl.find_opt defs key with
+          | Some d -> d
+          | None -> Util.error loc "unknown %s %s" (string_of_tag_kind kind) name
+        in
+        if Hashtbl.mem visiting key then
+          Util.error td.loc "recursive %s %s by value is not supported" (string_of_tag_kind td.tag_kind)
+            td.tag_name;
+        Hashtbl.add visiting key ();
+        if td.fields = [] then
+          Util.error td.loc "empty %s %s is not supported" (string_of_tag_kind td.tag_kind) td.tag_name;
+        let field_names = Hashtbl.create 16 in
+        let struct_off = ref 0 in
+        let union_size = ref 0 in
+        let max_align = ref 1 in
+        let fields_rev = ref [] in
+        List.iter
+          (fun (fty, fname, floc) ->
+            if Hashtbl.mem field_names fname then
+              Util.error floc "duplicate field %s in %s %s" fname (string_of_tag_kind td.tag_kind)
+                td.tag_name;
+            Hashtbl.add field_names fname ();
+            let fsize, falign =
+              match fty with
+              | Ast.TInt -> (4, 4)
+              | Ast.TChar -> (1, 1)
+              | Ast.TPtr _ -> (8, 8)
+              | Ast.TVoid -> Util.error floc "field %s cannot have type void" fname
+              | Ast.TStruct n ->
+                  let lay = resolve Ast.Struct n floc in
+                  (lay.size, lay.align)
+              | Ast.TUnion n ->
+                  let lay = resolve Ast.Union n floc in
+                  (lay.size, lay.align)
+            in
+            if falign > !max_align then max_align := falign;
+            let fld_offset =
+              match td.tag_kind with
+              | Ast.Struct ->
+                  let off = align_up !struct_off falign in
+                  struct_off := !struct_off + fsize;
+                  off
+              | Ast.Union ->
+                  if fsize > !union_size then union_size := fsize;
+                  0
+            in
+            fields_rev := { fld_name = fname; fld_ty = fty; fld_offset; fld_loc = floc } :: !fields_rev)
+          td.fields;
+        let align = !max_align in
+        let size =
+          match td.tag_kind with
+          | Ast.Struct -> align_up !struct_off align
+          | Ast.Union -> align_up !union_size align
+        in
+        Hashtbl.remove visiting key;
+        let layout =
+          { tag_kind = td.tag_kind
+          ; tag_name = td.tag_name
+          ; fields = List.rev !fields_rev
+          ; size
+          ; align
+          ; loc = td.loc
+          }
+        in
+        Hashtbl.add resolved key layout;
+        layout)
+  in
+  let ordered =
+    List.fold_left
+      (fun acc top ->
+        match top with
+        | Ast.TopFunc _ -> acc
+        | Ast.TopTypeDef td ->
+            let lay = resolve td.tag_kind td.tag_name td.loc in
+            lay :: acc)
+      [] prog
+    |> List.rev
+  in
+  (resolved, ordered)
+
+let build_func_env (prog : Ast.program) (tags : (string, tag_layout) Hashtbl.t) : env =
   let funcs = Hashtbl.create 32 in
   List.iter (fun (n, s) -> Hashtbl.add funcs n s) (builtin_funcs ());
   List.iter
-    (fun (f : Ast.func) ->
-      if Hashtbl.mem funcs f.name then Util.error f.loc "duplicate function %s" f.name;
-      let param_tys = List.map (fun (ty, _, _) -> ty) f.params in
-      Hashtbl.add funcs f.name { ret_ty = f.ret_ty; params = param_tys })
+    (function
+      | Ast.TopTypeDef _ -> ()
+      | Ast.TopFunc (f : Ast.func) ->
+          if Hashtbl.mem funcs f.name then Util.error f.loc "duplicate function %s" f.name;
+          if is_aggregate f.ret_ty then
+            Util.error f.loc "returning struct/union by value is not supported";
+          let param_tys =
+            List.map
+              (fun (pty, pname, ploc) ->
+                if equal_ty pty Ast.TVoid then
+                  Util.error ploc "parameter %s cannot have type void" pname;
+                if is_aggregate pty then
+                  Util.error ploc "parameter %s cannot be struct/union by value" pname;
+                pty)
+              f.params
+          in
+          Hashtbl.add funcs f.name { ret_ty = f.ret_ty; params = param_tys })
     prog;
-  { funcs; next_var = 0 }
+  { funcs; tags; next_var = 0 }
 
 let fresh_var (env : env) : var_id =
   let id = env.next_var in
   env.next_var <- env.next_var + 1;
   id
+
+let require_complete_aggregate (env : env) (ty : ty) (loc : Loc.t) : unit =
+  match ty with
+  | Ast.TStruct n ->
+      if not (Hashtbl.mem env.tags (tag_key Ast.Struct n)) then Util.error loc "unknown struct %s" n
+  | Ast.TUnion n ->
+      if not (Hashtbl.mem env.tags (tag_key Ast.Union n)) then Util.error loc "unknown union %s" n
+  | _ -> ()
+
+let lookup_member (env : env) (agg_ty : ty) (field_name : string) (loc : Loc.t) : field_layout =
+  let layout, kind_s, name =
+    match agg_ty with
+    | Ast.TStruct n -> (
+        match Hashtbl.find_opt env.tags (tag_key Ast.Struct n) with
+        | Some t -> (t, "struct", n)
+        | None -> Util.error loc "unknown struct %s" n)
+    | Ast.TUnion n -> (
+        match Hashtbl.find_opt env.tags (tag_key Ast.Union n) with
+        | Some t -> (t, "union", n)
+        | None -> Util.error loc "unknown union %s" n)
+    | _ -> Util.error loc "member access requires struct/union type"
+  in
+  match List.find_opt (fun f -> String.equal f.fld_name field_name) layout.fields with
+  | Some f -> f
+  | None -> Util.error loc "unknown field %s in %s %s" field_name kind_s name
+
+let rec root_var_of_lvalue (lv : tlvalue) : var_id option =
+  match lv.lv_node with
+  | LVar id -> Some id
+  | LDeref _ -> None
+  | LMember (base, _) -> root_var_of_lvalue base
 
 let rec tc_expr (env : env) (venv : venv) (inits : IntSet.t) (e : Ast.expr) :
     texpr * IntSet.t =
@@ -194,6 +376,8 @@ let rec tc_expr (env : env) (venv : venv) (inits : IntSet.t) (e : Ast.expr) :
       | None -> Util.error loc "undeclared identifier %s" name
       | Some sym ->
           if not (IntSet.mem sym.vid inits) then Util.error loc "use of uninitialized variable %s" name;
+          if is_aggregate sym.vty then
+            Util.error loc "cannot use aggregate value directly (use member access or &)";
           ({ e_node = EVar sym.vid; e_ty = sym.vty; e_loc = loc }, inits))
   | Ast.Call (fname, args) -> (
       match Hashtbl.find_opt env.funcs fname with
@@ -206,13 +390,14 @@ let rec tc_expr (env : env) (venv : venv) (inits : IntSet.t) (e : Ast.expr) :
           ({ e_node = ECall (fname, targs); e_ty = fsig.ret_ty; e_loc = loc }, inits'))
   | Ast.Assign (lhs, rhs) ->
       let tlv, inits1 = tc_lvalue env venv inits lhs in
+      if is_aggregate tlv.lv_ty then Util.error loc "aggregate assignment is not supported";
       let trhs, inits2 = tc_expr env venv inits1 rhs in
       check_convert ~dst:tlv.lv_ty ~src:trhs.e_ty ~loc:trhs.e_loc;
       let trhs' = cast_expr ~dst:tlv.lv_ty trhs in
       let inits3 =
-        match tlv.lv_node with
-        | LVar id -> IntSet.add id inits2
-        | LDeref _ -> inits2
+        match root_var_of_lvalue tlv with
+        | Some id -> IntSet.add id inits2
+        | None -> inits2
       in
       ( { e_node = EAssign (tlv, trhs'); e_ty = tlv.lv_ty; e_loc = loc }
       , inits3 )
@@ -223,6 +408,11 @@ let rec tc_expr (env : env) (venv : venv) (inits : IntSet.t) (e : Ast.expr) :
   | Ast.Unop (uop, inner) ->
       let te, inits' = tc_expr env venv inits inner in
       tc_unop env venv inits' loc uop te
+  | Ast.Member _ | Ast.PtrMember _ ->
+      let lv, inits' = tc_lvalue ~for_read:true env venv inits e in
+      if is_aggregate lv.lv_ty then
+        Util.error loc "cannot use aggregate value directly (use member access or &)";
+      ({ e_node = ELvalue lv; e_ty = lv.lv_ty; e_loc = loc }, inits')
 
 and tc_args (env : env) (venv : venv) (inits : IntSet.t) (args : Ast.expr list)
     (param_tys : ty list) : texpr list * IntSet.t =
@@ -238,7 +428,7 @@ and tc_args (env : env) (venv : venv) (inits : IntSet.t) (args : Ast.expr list)
   in
   loop [] inits args param_tys
 
-and tc_lvalue (env : env) (venv : venv) (inits : IntSet.t) (e : Ast.expr) :
+and tc_lvalue ?(for_read = false) (env : env) (venv : venv) (inits : IntSet.t) (e : Ast.expr) :
     tlvalue * IntSet.t =
   let loc = e.eloc in
   match e.enode with
@@ -246,6 +436,8 @@ and tc_lvalue (env : env) (venv : venv) (inits : IntSet.t) (e : Ast.expr) :
       match find_var venv name with
       | None -> Util.error loc "undeclared identifier %s" name
       | Some sym ->
+          if for_read && not (IntSet.mem sym.vid inits) then
+            Util.error loc "use of uninitialized variable %s" name;
           ({ lv_node = LVar sym.vid; lv_ty = sym.vty; lv_loc = loc }, inits))
   | Ast.Unop (Ast.Deref, inner) ->
       let te, inits' = tc_expr env venv inits inner in
@@ -256,6 +448,21 @@ and tc_lvalue (env : env) (venv : venv) (inits : IntSet.t) (e : Ast.expr) :
       in
       if equal_ty pointee Ast.TVoid then Util.error loc "cannot dereference void*";
       ({ lv_node = LDeref te; lv_ty = pointee; lv_loc = loc }, inits')
+  | Ast.Member (base, field_name) ->
+      let base_lv, inits' = tc_lvalue ~for_read env venv inits base in
+      let fld = lookup_member env base_lv.lv_ty field_name loc in
+      ({ lv_node = LMember (base_lv, fld); lv_ty = fld.fld_ty; lv_loc = loc }, inits')
+  | Ast.PtrMember (base, field_name) ->
+      let te, inits' = tc_expr env venv inits base in
+      let pointee =
+        match te.e_ty with
+        | Ast.TPtr t -> t
+        | _ -> Util.error loc "operator -> requires pointer type"
+      in
+      if equal_ty pointee Ast.TVoid then Util.error loc "cannot dereference void*";
+      let fld = lookup_member env pointee field_name loc in
+      let base_lv = { lv_node = LDeref te; lv_ty = pointee; lv_loc = base.eloc } in
+      ({ lv_node = LMember (base_lv, fld); lv_ty = fld.fld_ty; lv_loc = loc }, inits')
   | _ -> Util.error loc "expected lvalue"
 
 and tc_binop (env : env) (venv : venv) (inits : IntSet.t) (loc : Loc.t) (op : Ast.binop)
@@ -310,6 +517,8 @@ and tc_unop (_env : env) (_venv : venv) (inits : IntSet.t) (loc : Loc.t) (uop : 
         | _ -> Util.error loc "cannot dereference non-pointer type %s" (string_of_ty te.e_ty)
       in
       if equal_ty pointee Ast.TVoid then Util.error loc "cannot dereference void*";
+      if is_aggregate pointee then
+        Util.error loc "cannot use aggregate value directly (use member access or &)";
       ({ e_node = EUnop (Ast.Deref, te); e_ty = pointee; e_loc = loc }, inits)
   | Ast.AddrOf -> assert false
 
@@ -380,6 +589,9 @@ and tc_block_items (env : env) (venv : venv) (inits : IntSet.t) ~(in_loop : bool
             loop (DStmt ts :: acc) r.inits r.falls_through tl
         | Ast.Decl (vty, name, init_opt, dloc) ->
             if equal_ty vty Ast.TVoid then Util.error dloc "cannot declare variable of type void";
+            if is_aggregate vty then require_complete_aggregate env vty dloc;
+            if is_aggregate vty && Option.is_some init_opt then
+              Util.error dloc "aggregate initialization is not supported";
             let id = fresh_var env in
             let sym = { vid = id; vty; vname = name; vloc = dloc } in
             add_var venv sym;
@@ -402,6 +614,7 @@ and tc_block_items (env : env) (venv : venv) (inits : IntSet.t) ~(in_loop : bool
   loop [] inits true items
 
 let tc_function (env : env) (f : Ast.func) : tfunc =
+  if is_aggregate f.ret_ty then Util.error f.loc "returning struct/union by value is not supported";
   let venv0 = [ Hashtbl.create 32 ] in
   let locals_rev = ref [] in
   let params =
@@ -409,6 +622,7 @@ let tc_function (env : env) (f : Ast.func) : tfunc =
     List.map
       (fun (pty, pname, ploc) ->
         if equal_ty pty Ast.TVoid then Util.error ploc "parameter %s cannot have type void" pname;
+        if is_aggregate pty then Util.error ploc "parameter %s cannot be struct/union by value" pname;
         if Hashtbl.mem seen pname then Util.error ploc "duplicate parameter name %s" pname;
         Hashtbl.add seen pname ();
         let pid = fresh_var env in
@@ -429,6 +643,13 @@ let tc_function (env : env) (f : Ast.func) : tfunc =
   { ret_ty = f.ret_ty; name = f.name; params; body; locals; loc = f.loc }
 
 let typecheck (prog : Ast.program) : tprogram =
-  let env = build_func_env prog in
-  List.map (tc_function env) prog
-
+  let tags_tbl, tags = build_tag_layouts prog in
+  let env = build_func_env prog tags_tbl in
+  let funcs =
+    List.filter_map
+      (function
+        | Ast.TopFunc f -> Some (tc_function env f)
+        | Ast.TopTypeDef _ -> None)
+      prog
+  in
+  { funcs; tags }

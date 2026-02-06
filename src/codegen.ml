@@ -13,11 +13,42 @@ type env =
   ; mutable loop_stack : (string * string) list
   }
 
+let string_of_tag_kind = function
+  | Ast.Struct -> "struct"
+  | Ast.Union -> "union"
+
+let tag_key (kind : Ast.tag_kind) (name : string) : string =
+  Printf.sprintf "%s:%s" (string_of_tag_kind kind) name
+
+let is_aggregate_ty = function
+  | Ast.TStruct _ | Ast.TUnion _ -> true
+  | _ -> false
+
 let llty_of_mini = function
   | Ast.TInt -> Llvm_ir.I32
   | Ast.TChar -> Llvm_ir.I8
   | Ast.TVoid -> Llvm_ir.Void
   | Ast.TPtr _ -> Llvm_ir.Ptr
+  | Ast.TStruct _ | Ast.TUnion _ ->
+      Util.error Loc.none "internal: aggregate value type in llty_of_mini"
+
+let aggregate_layout (tag_layouts : (string, tag_layout) Hashtbl.t) (ty : Ast.ty) : tag_layout =
+  match ty with
+  | Ast.TStruct n -> (
+      match Hashtbl.find_opt tag_layouts (tag_key Ast.Struct n) with
+      | Some lay -> lay
+      | None -> Util.error Loc.none "internal: unknown struct %s in codegen" n)
+  | Ast.TUnion n -> (
+      match Hashtbl.find_opt tag_layouts (tag_key Ast.Union n) with
+      | Some lay -> lay
+      | None -> Util.error Loc.none "internal: unknown union %s in codegen" n)
+  | _ -> Util.error Loc.none "internal: aggregate_layout expects struct/union type"
+
+let storage_ty_string (tag_layouts : (string, tag_layout) Hashtbl.t) (ty : Ast.ty) : string =
+  if is_aggregate_ty ty then
+    Printf.sprintf "[%d x i8]" (aggregate_layout tag_layouts ty).size
+  else
+    Llvm_ir.string_of_llty (llty_of_mini ty)
 
 let bool_of_scalar (b : Llvm_ir.builder) (v : Llvm_ir.value) : Llvm_ir.value =
   match v.ty with
@@ -30,6 +61,19 @@ let bool_of_scalar (b : Llvm_ir.builder) (v : Llvm_ir.value) : Llvm_ir.value =
   | Llvm_ir.Ptr -> Llvm_ir.emit_icmp b "ne" Llvm_ir.Ptr v { v = "null"; ty = Llvm_ir.Ptr }
   | Llvm_ir.Void -> Util.error Loc.none "internal: void value in boolean context"
 
+let load_from_addr (b : Llvm_ir.builder) (ty : Ast.ty) (addr : Llvm_ir.value) : Llvm_ir.value =
+  if is_aggregate_ty ty then Util.error Loc.none "internal: cannot load aggregate by value";
+  let llty = llty_of_mini ty in
+  let r = Llvm_ir.fresh_reg b in
+  Llvm_ir.emit b (Printf.sprintf "%s = load %s, ptr %s" r (Llvm_ir.string_of_llty llty) addr.v);
+  { Llvm_ir.v = r; ty = llty }
+
+let store_to_addr (b : Llvm_ir.builder) (ty : Ast.ty) (v : Llvm_ir.value) (addr : Llvm_ir.value) : unit
+    =
+  if is_aggregate_ty ty then Util.error Loc.none "internal: cannot store aggregate by value";
+  let llty = llty_of_mini ty in
+  Llvm_ir.emit b (Printf.sprintf "store %s %s, ptr %s" (Llvm_ir.string_of_llty llty) v.v addr.v)
+
 let rec gen_lvalue (b : Llvm_ir.builder) (env : env) (lv : tlvalue) : Llvm_ir.value * Ast.ty =
   match lv.lv_node with
   | LVar id -> (
@@ -39,6 +83,11 @@ let rec gen_lvalue (b : Llvm_ir.builder) (env : env) (lv : tlvalue) : Llvm_ir.va
   | LDeref e ->
       let pv = gen_expr b env e in
       (pv, lv.lv_ty)
+  | LMember (base, fld) ->
+      let base_addr, _ = gen_lvalue b env base in
+      let r = Llvm_ir.fresh_reg b in
+      Llvm_ir.emit b (Printf.sprintf "%s = getelementptr i8, ptr %s, i32 %d" r base_addr.v fld.fld_offset);
+      ({ Llvm_ir.v = r; ty = Llvm_ir.Ptr }, lv.lv_ty)
 
 and gen_expr (b : Llvm_ir.builder) (env : env) (e : texpr) : Llvm_ir.value =
   match e.e_node with
@@ -46,12 +95,10 @@ and gen_expr (b : Llvm_ir.builder) (env : env) (e : texpr) : Llvm_ir.value =
   | EVar id -> (
       match IntMap.find_opt id env.vars with
       | None -> Util.error e.e_loc "unknown var id %d" id
-      | Some info ->
-          let llty = llty_of_mini info.ty in
-          let r = Llvm_ir.fresh_reg b in
-          Llvm_ir.emit b
-            (Printf.sprintf "%s = load %s, ptr %s" r (Llvm_ir.string_of_llty llty) info.addr.v);
-          { v = r; ty = llty })
+      | Some info -> load_from_addr b info.ty info.addr)
+  | ELvalue lv ->
+      let addr, ty = gen_lvalue b env lv in
+      load_from_addr b ty addr
   | ECall (name, args) ->
       let args_v = List.map (gen_expr b env) args in
       let arg_str =
@@ -72,10 +119,8 @@ and gen_expr (b : Llvm_ir.builder) (env : env) (e : texpr) : Llvm_ir.value =
   | EAssign (lv, rhs) ->
       let addr, dst_ty = gen_lvalue b env lv in
       let rv = gen_expr b env rhs in
-      let llty = llty_of_mini dst_ty in
-      Llvm_ir.emit b
-        (Printf.sprintf "store %s %s, ptr %s" (Llvm_ir.string_of_llty llty) rv.v addr.v);
-      { rv with ty = llty }
+      store_to_addr b dst_ty rv addr;
+      { rv with ty = llty_of_mini dst_ty }
   | EBinop (op, a, c) -> gen_binop b env e.e_loc op a c
   | EUnop (uop, a) -> gen_unop b env e.e_ty uop a
   | EAddrOf lv ->
@@ -168,10 +213,7 @@ and gen_unop (b : Llvm_ir.builder) (env : env) (result_ty : Ast.ty) (uop : Ast.u
       Llvm_ir.emit_cast b "zext" Llvm_ir.I1 Llvm_ir.I32 inv
   | Ast.Deref ->
       let pv = gen_expr b env a in
-      let llty = llty_of_mini result_ty in
-      let r = Llvm_ir.fresh_reg b in
-      Llvm_ir.emit b (Printf.sprintf "%s = load %s, ptr %s" r (Llvm_ir.string_of_llty llty) pv.v);
-      { v = r; ty = llty }
+      load_from_addr b result_ty pv
   | Ast.AddrOf -> Util.error Loc.none "internal: AddrOf should be EAddrOf"
 
 let rec gen_stmt (b : Llvm_ir.builder) (env : env) (s : tstmt) : unit =
@@ -242,14 +284,12 @@ and gen_item (b : Llvm_ir.builder) (env : env) (item : tdecl_or_stmt) : unit =
       | None -> ()
       | Some e ->
           let v = gen_expr b env e in
-          let llty = llty_of_mini ty in
           let addr =
             match IntMap.find_opt id env.vars with
             | None -> Util.error e.e_loc "unknown var id %d" id
             | Some info -> info.addr
           in
-          Llvm_ir.emit b
-            (Printf.sprintf "store %s %s, ptr %s" (Llvm_ir.string_of_llty llty) v.v addr.v))
+          store_to_addr b ty v addr)
 
 let declare_builtins () : string =
   String.concat "\n"
@@ -259,14 +299,19 @@ let declare_builtins () : string =
     ; "declare void @free(ptr)"
     ]
 
-let gen_function (f : tfunc) : string =
+let gen_function (tag_layouts : (string, tag_layout) Hashtbl.t) (f : tfunc) : string =
   let b = Llvm_ir.create_builder () in
   let vars =
     List.fold_left
       (fun m (id, ty, _name) ->
-        let llty = llty_of_mini ty in
         let addr_reg = Llvm_ir.fresh_reg b in
-        Llvm_ir.emit b (Printf.sprintf "%s = alloca %s" addr_reg (Llvm_ir.string_of_llty llty));
+        if is_aggregate_ty ty then (
+          let lay = aggregate_layout tag_layouts ty in
+          Llvm_ir.emit b
+            (Printf.sprintf "%s = alloca %s, align %d" addr_reg
+               (storage_ty_string tag_layouts ty) lay.align))
+        else
+          Llvm_ir.emit b (Printf.sprintf "%s = alloca %s" addr_reg (storage_ty_string tag_layouts ty));
         IntMap.add id { ty; addr = { v = addr_reg; ty = Llvm_ir.Ptr } } m)
       IntMap.empty f.locals
   in
@@ -284,7 +329,9 @@ let gen_function (f : tfunc) : string =
     | Ast.TVoid -> Llvm_ir.terminate b "ret void"
     | Ast.TChar -> Llvm_ir.terminate b "ret i8 0"
     | Ast.TInt -> Llvm_ir.terminate b "ret i32 0"
-    | Ast.TPtr _ -> Llvm_ir.terminate b "ret ptr null");
+    | Ast.TPtr _ -> Llvm_ir.terminate b "ret ptr null"
+    | Ast.TStruct _ | Ast.TUnion _ ->
+        Util.error Loc.none "internal: aggregate return should be rejected in typecheck");
   let params_sig =
     f.params
     |> List.map (fun p ->
@@ -298,5 +345,9 @@ let gen_function (f : tfunc) : string =
   header ^ Llvm_ir.pp_blocks b ^ "}\n"
 
 let gen_program (prog : tprogram) : string =
-  let funcs = prog |> List.map gen_function |> String.concat "\n" in
+  let tag_layouts = Hashtbl.create 32 in
+  List.iter
+    (fun (t : tag_layout) -> Hashtbl.replace tag_layouts (tag_key t.tag_kind t.tag_name) t)
+    prog.tags;
+  let funcs = prog.funcs |> List.map (gen_function tag_layouts) |> String.concat "\n" in
   declare_builtins () ^ "\n\n" ^ funcs

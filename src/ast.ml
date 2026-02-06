@@ -3,6 +3,8 @@ type ty =
   | TChar
   | TVoid
   | TPtr of ty
+  | TStruct of string
+  | TUnion of string
 
 type binop =
   | Add
@@ -38,6 +40,8 @@ and expr_node =
   | Assign of expr * expr
   | Binop of binop * expr * expr
   | Unop of unop * expr
+  | Member of expr * string
+  | PtrMember of expr * string
 
 type stmt =
   { snode : stmt_node
@@ -59,6 +63,11 @@ and decl_or_stmt =
   | Stmt of stmt
 
 type param = ty * string * Loc.t
+type field = ty * string * Loc.t
+
+type tag_kind =
+  | Struct
+  | Union
 
 type func =
   { ret_ty : ty
@@ -68,4 +77,15 @@ type func =
   ; loc : Loc.t
   }
 
-type program = func list
+type type_def =
+  { tag_kind : tag_kind
+  ; tag_name : string
+  ; fields : field list
+  ; loc : Loc.t
+  }
+
+type top =
+  | TopFunc of func
+  | TopTypeDef of type_def
+
+type program = top list

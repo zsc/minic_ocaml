@@ -4,6 +4,8 @@ type kind =
   | Kw_int
   | Kw_char
   | Kw_void
+  | Kw_struct
+  | Kw_union
   | Kw_if
   | Kw_else
   | Kw_while
@@ -16,8 +18,10 @@ type kind =
   | R_brace
   | Comma
   | Semi
+  | Dot
   | Plus
   | Minus
+  | Arrow
   | Star
   | Slash
   | Percent
@@ -45,6 +49,8 @@ let kind_to_string = function
   | Kw_int -> "int"
   | Kw_char -> "char"
   | Kw_void -> "void"
+  | Kw_struct -> "struct"
+  | Kw_union -> "union"
   | Kw_if -> "if"
   | Kw_else -> "else"
   | Kw_while -> "while"
@@ -57,8 +63,10 @@ let kind_to_string = function
   | R_brace -> "}"
   | Comma -> ","
   | Semi -> ";"
+  | Dot -> "."
   | Plus -> "+"
   | Minus -> "-"
+  | Arrow -> "->"
   | Star -> "*"
   | Slash -> "/"
   | Percent -> "%"
@@ -74,4 +82,3 @@ let kind_to_string = function
   | Amp_amp -> "&&"
   | Pipe_pipe -> "||"
   | Eof -> "<eof>"
-

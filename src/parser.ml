@@ -30,25 +30,83 @@ let current_loc (p : t) : Loc.t = p.cur.loc
 
 let span_from (a : Loc.t) (b : Loc.t) : Loc.t = { Loc.start = a.start; end_ = b.end_ }
 
+let expect_ident (p : t) ~(what : string) : string * Loc.t =
+  match p.cur.kind with
+  | Token.Ident s ->
+      let loc = p.cur.loc in
+      bump p;
+      (s, loc)
+  | _ -> Util.error p.cur.loc "%s, got %s" what (Token.kind_to_string p.cur.kind)
+
+let parse_tag_head (p : t) : Ast.tag_kind * string * Ast.ty =
+  match p.cur.kind with
+  | Token.Kw_struct ->
+      bump p;
+      let name, _ = expect_ident p ~what:"expected struct tag name" in
+      (Ast.Struct, name, Ast.TStruct name)
+  | Token.Kw_union ->
+      bump p;
+      let name, _ = expect_ident p ~what:"expected union tag name" in
+      (Ast.Union, name, Ast.TUnion name)
+  | _ -> Util.error p.cur.loc "expected struct/union tag head"
+
+let rec parse_ptr_suffix (p : t) (ty : Ast.ty) : Ast.ty =
+  match accept p Token.Star with
+  | Some _ -> parse_ptr_suffix p (Ast.TPtr ty)
+  | None -> ty
+
 let rec parse_program (p : t) : Ast.program =
   let rec loop acc =
     match p.cur.kind with
     | Token.Eof -> List.rev acc
     | _ ->
-        let f = parse_function p in
-        loop (f :: acc)
+        let top = parse_top p in
+        loop (top :: acc)
   in
   loop []
+
+and parse_top (p : t) : Ast.top =
+  match p.cur.kind with
+  | Token.Kw_struct | Token.Kw_union ->
+      let start_loc = current_loc p in
+      let tag_kind, tag_name, tag_ty = parse_tag_head p in
+      if p.cur.kind = Token.L_brace then
+        Ast.TopTypeDef (parse_type_def_after_head p start_loc tag_kind tag_name)
+      else
+        let ret_ty = parse_ptr_suffix p tag_ty in
+        Ast.TopFunc (parse_function_with_ret p start_loc ret_ty)
+  | _ ->
+      let f = parse_function p in
+      Ast.TopFunc f
+
+and parse_type_def_after_head (p : t) (start_loc : Loc.t) (tag_kind : Ast.tag_kind)
+    (tag_name : string) : Ast.type_def =
+  ignore (expect p Token.L_brace);
+  let rec parse_fields acc =
+    match p.cur.kind with
+    | Token.R_brace ->
+        ignore (expect p Token.R_brace);
+        let semi = expect p Token.Semi in
+        { Ast.tag_kind; tag_name; fields = List.rev acc; loc = span_from start_loc semi.loc }
+    | Token.Eof -> Util.error p.cur.loc "unexpected end of file in struct/union definition"
+    | _ ->
+        let field_start = current_loc p in
+        let fty = parse_type p in
+        let fname, _ = expect_ident p ~what:"expected field name" in
+        let semi = expect p Token.Semi in
+        let floc = span_from field_start semi.loc in
+        parse_fields ((fty, fname, floc) :: acc)
+  in
+  parse_fields []
 
 and parse_function (p : t) : Ast.func =
   let start_loc = current_loc p in
   let ret_ty = parse_type p in
-  let name =
-    match p.cur.kind with
-    | Token.Ident s ->
-        bump p;
-        s
-    | _ -> Util.error p.cur.loc "expected function name, got %s" (Token.kind_to_string p.cur.kind)
+  parse_function_with_ret p start_loc ret_ty
+
+and parse_function_with_ret (p : t) (start_loc : Loc.t) (ret_ty : Ast.ty) : Ast.func =
+  let name, _ =
+    expect_ident p ~what:"expected function name"
   in
   ignore (expect p Token.L_paren);
   let params =
@@ -75,12 +133,8 @@ and parse_param_list (p : t) : Ast.param list =
 
 and parse_param (p : t) : Ast.param =
   let ty = parse_type p in
-  match p.cur.kind with
-  | Token.Ident s ->
-      let loc = p.cur.loc in
-      bump p;
-      (ty, s, loc)
-  | _ -> Util.error p.cur.loc "expected parameter name"
+  let name, loc = expect_ident p ~what:"expected parameter name" in
+  (ty, name, loc)
 
 and parse_type (p : t) : Ast.ty =
   let base =
@@ -94,14 +148,12 @@ and parse_type (p : t) : Ast.ty =
     | Token.Kw_void ->
         bump p;
         Ast.TVoid
+    | Token.Kw_struct | Token.Kw_union ->
+        let _, _, ty = parse_tag_head p in
+        ty
     | _ -> Util.error p.cur.loc "expected type, got %s" (Token.kind_to_string p.cur.kind)
   in
-  let rec stars ty =
-    match accept p Token.Star with
-    | Some _ -> stars (Ast.TPtr ty)
-    | None -> ty
-  in
-  stars base
+  parse_ptr_suffix p base
 
 and parse_block (p : t) : Ast.stmt =
   let lbrace = expect p Token.L_brace in
@@ -120,16 +172,10 @@ and parse_block (p : t) : Ast.stmt =
 
 and parse_decl_or_stmt (p : t) : Ast.decl_or_stmt =
   match p.cur.kind with
-  | Token.Kw_int | Token.Kw_char | Token.Kw_void ->
+  | Token.Kw_int | Token.Kw_char | Token.Kw_void | Token.Kw_struct | Token.Kw_union ->
       let start_loc = current_loc p in
       let ty = parse_type p in
-      let name =
-        match p.cur.kind with
-        | Token.Ident s ->
-            bump p;
-            s
-        | _ -> Util.error p.cur.loc "expected identifier in declaration"
-      in
+      let name, _ = expect_ident p ~what:"expected identifier in declaration" in
       let init =
         match accept p Token.Eq with
         | Some _ -> Some (parse_expr p)
@@ -346,7 +392,24 @@ and parse_unary (p : t) : Ast.expr =
       bump p;
       let e = parse_unary p in
       { enode = Unop (Deref, e); eloc = span_from start_loc e.eloc }
-  | _ -> parse_primary p
+  | _ -> parse_postfix p
+
+and parse_postfix (p : t) : Ast.expr =
+  let rec loop (acc : Ast.expr) : Ast.expr =
+    match p.cur.kind with
+    | Token.Dot ->
+        bump p;
+        let field, floc = expect_ident p ~what:"expected member name after '.'" in
+        let loc = span_from acc.eloc floc in
+        loop { enode = Member (acc, field); eloc = loc }
+    | Token.Arrow ->
+        bump p;
+        let field, floc = expect_ident p ~what:"expected member name after '->'" in
+        let loc = span_from acc.eloc floc in
+        loop { enode = PtrMember (acc, field); eloc = loc }
+    | _ -> acc
+  in
+  loop (parse_primary p)
 
 and parse_primary (p : t) : Ast.expr =
   match p.cur.kind with
@@ -358,31 +421,23 @@ and parse_primary (p : t) : Ast.expr =
       let id_tok = p.cur in
       bump p;
       let loc_start = id_tok.loc in
-      let node =
+      let node, end_loc =
         match accept p Token.L_paren with
         | Some _ ->
-            let args =
+            let args, rparen_loc =
               match p.cur.kind with
               | Token.R_paren ->
-                  bump p;
-                  []
+                  let rp = expect p Token.R_paren in
+                  ([], rp.loc)
               | _ ->
-                  let args = parse_arg_list p in
-                  ignore (expect p Token.R_paren);
-                  args
+                  let xs = parse_arg_list p in
+                  let rp = expect p Token.R_paren in
+                  (xs, rp.loc)
             in
-            Ast.Call (s, args)
-        | None -> Ast.Var s
+            (Ast.Call (s, args), rparen_loc)
+        | None -> (Ast.Var s, loc_start)
       in
-      let loc =
-        match node with
-        | Ast.Call (_, args) -> (
-            match List.rev args with
-            | [] -> loc_start
-            | last :: _ -> span_from loc_start last.eloc)
-        | _ -> loc_start
-      in
-      { enode = node; eloc = loc }
+      { enode = node; eloc = span_from loc_start end_loc }
   | Token.L_paren ->
       ignore (expect p Token.L_paren);
       let e = parse_expr p in
